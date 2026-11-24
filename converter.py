@@ -1,7 +1,6 @@
 import argparse
 import io
 import os
-import re
 import shutil
 from pathlib import Path
 from typing import Callable, List, Optional
@@ -12,11 +11,21 @@ from docx import Document
 from docx.shared import Pt
 from docx.oxml import OxmlElement
 from docx.oxml.ns import qn
+from google import genai
+from google.genai import types
 
 if not shutil.which("tesseract"):
     default_tesseract = r"C:\Program Files\Tesseract-OCR\tesseract.exe"
     if os.path.exists(default_tesseract):
         pytesseract.pytesseract.tesseract_cmd = default_tesseract
+
+DEFAULT_MODEL = "gemini-2.5-flash"
+
+VISION_PROMPT = """Extract all text from this document page accurately.
+Rules:
+1. Preserve both Myanmar (Unicode) and English text exactly as shown in the image.
+2. Keep original spelling, punctuation, numbers, and line/paragraph breaks as faithfully as possible.
+3. Do NOT translate, summarize, or add commentary. Output only the extracted text."""
 
 
 def set_run_font(run, font_name: str = "Pyidaungsu", font_size: int = 11) -> None:
@@ -33,70 +42,72 @@ def set_run_font(run, font_name: str = "Pyidaungsu", font_size: int = 11) -> Non
     rFonts.set(qn("w:cs"), font_name)
 
 
-def clean_ocr_text(raw_text: str) -> str:
-    """Clean up common OCR noise, symbols, and line breaks automatically."""
-    lines = [re.sub(r"[ \t]+", " ", line).strip() for line in raw_text.splitlines()]
-    paragraphs: List[str] = []
-    current_para: List[str] = []
-
-    for line in lines:
-        if not line:
-            if current_para:
-                paragraphs.append(" ".join(current_para))
-                current_para = []
-            continue
-
-        # Remove standalone noisy symbol/punctuation lines
-        if re.fullmatch(r"[\W_]+", line):
-            continue
-
-        if current_para:
-            prev = current_para[-1]
-            if not re.search(r"[။!?…:]$", prev):
-                current_para[-1] = f"{prev} {line}"
-            else:
-                paragraphs.append(" ".join(current_para))
-                current_para = [line]
-        else:
-            current_para.append(line)
-
-    if current_para:
-        paragraphs.append(" ".join(current_para))
-
-    cleaned = "\n\n".join(paragraphs)
-
-    # Remove common OCR noise characters around Myanmar/English text
-    cleaned = re.sub(r"[()|~^#*\[\]<>_=+@]+", " ", cleaned)
-    # Remove isolated 1-character Latin noise surrounded by spaces
-    cleaned = re.sub(r"(?<=\s)[b-hj-zB-HJ-Z](?=\s)", " ", cleaned)
-    # Clean up spaces before Myanmar punctuation
-    cleaned = re.sub(r"\s+([၊။])", r"\1", cleaned)
-    # Collapse multiple spaces
-    cleaned = re.sub(r"[ \t]{2,}", " ", cleaned)
-    # Clean up multiple blank lines
-    cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)
-    return cleaned.strip()
+def apply_doc_font(doc: Document, font_name: str = "Pyidaungsu", font_size: int = 11) -> None:
+    """Apply font across default and common Word styles."""
+    style_names = ["Normal", "Heading 1", "Heading 2", "Heading 3", "List Paragraph"]
+    for name in style_names:
+        if name in doc.styles:
+            style = doc.styles[name]
+            style.font.name = font_name
+            if name == "Normal":
+                style.font.size = Pt(font_size)
+            rPr = style._element.get_or_add_rPr()
+            rFonts = rPr.find(qn("w:rFonts"))
+            if rFonts is None:
+                rFonts = OxmlElement("w:rFonts")
+                rPr.insert(0, rFonts)
+            rFonts.set(qn("w:ascii"), font_name)
+            rFonts.set(qn("w:hAnsi"), font_name)
+            rFonts.set(qn("w:cs"), font_name)
 
 
-def ocr_page(page: fitz.Page, dpi: int = 400, lang: str = "mya") -> str:
-    """Render a PDF page to an image and run Tesseract OCR."""
+def render_page_png_bytes(page: fitz.Page, dpi: int = 250) -> bytes:
+    """Render a PDF page to PNG bytes."""
     pix = page.get_pixmap(dpi=dpi)
-    img = Image.open(io.BytesIO(pix.tobytes("png")))
+    return pix.tobytes("png")
+
+
+def gemini_vision_page(
+    png_bytes: bytes,
+    api_key: str,
+    model_name: str = DEFAULT_MODEL,
+) -> str:
+    """Extract Myanmar + English text from a page image using Gemini Vision."""
+    client = genai.Client(api_key=api_key)
+    response = client.models.generate_content(
+        model=model_name,
+        contents=[
+            types.Part.from_bytes(data=png_bytes, mime_type="image/png"),
+            VISION_PROMPT,
+        ],
+    )
+    return (response.text or "").strip()
+
+
+def tesseract_ocr_page(png_bytes: bytes, lang: str = "mya+eng") -> str:
+    """Fallback OCR using Tesseract."""
+    img = Image.open(io.BytesIO(png_bytes))
     gray = ImageOps.grayscale(img)
     enhanced = ImageOps.autocontrast(gray)
-    text = pytesseract.image_to_string(enhanced, lang=lang, config="--psm 6")
-    return clean_ocr_text(text)
+    return pytesseract.image_to_string(enhanced, lang=lang, config="--psm 6").strip()
 
 
 def extract_pages_text(
     pdf_bytes: bytes,
-    ocr_lang: str = "mya",
-    force_ocr: bool = True,
+    use_gemini_vision: bool = True,
+    gemini_api_key: Optional[str] = None,
+    gemini_model: str = DEFAULT_MODEL,
+    ocr_lang: str = "mya+eng",
+    force_vision_or_ocr: bool = True,
     min_chars_threshold: int = 20,
-    dpi: int = 400,
+    dpi: int = 250,
     progress_callback: Optional[Callable[[int, int, str], None]] = None,
 ) -> List[str]:
-    """Extract text per page from PDF bytes (with automatic/forced OCR fallback)."""
+    """Extract text per page using digital text first or Gemini Vision / Tesseract OCR."""
+    api_key = (gemini_api_key or os.getenv("GEMINI_API_KEY") or "").strip()
+    if use_gemini_vision and not api_key:
+        raise ValueError("Gemini API key is missing. Enter it in the sidebar or set GEMINI_API_KEY.")
+
     pdf_doc = fitz.open(stream=pdf_bytes, filetype="pdf")
     total_pages = len(pdf_doc)
     pages_text: List[str] = []
@@ -104,16 +115,30 @@ def extract_pages_text(
     try:
         for page_index in range(total_pages):
             page = pdf_doc[page_index]
-            raw_text = "" if force_ocr else page.get_text("text").strip()
+            raw_text = "" if force_vision_or_ocr else page.get_text("text").strip()
 
-            if force_ocr or len(raw_text) < min_chars_threshold:
-                if progress_callback:
-                    progress_callback(
-                        page_index + 1,
-                        total_pages,
-                        f"Page {page_index + 1}/{total_pages}: Running OCR ({ocr_lang}, {dpi} DPI)...",
+            if force_vision_or_ocr or len(raw_text) < min_chars_threshold:
+                png_bytes = render_page_png_bytes(page, dpi=dpi)
+                if use_gemini_vision:
+                    if progress_callback:
+                        progress_callback(
+                            page_index + 1,
+                            total_pages,
+                            f"Page {page_index + 1}/{total_pages}: Reading with Gemini Vision ({gemini_model})...",
+                        )
+                    text = gemini_vision_page(
+                        png_bytes=png_bytes,
+                        api_key=api_key,
+                        model_name=gemini_model,
                     )
-                text = ocr_page(page, dpi=dpi, lang=ocr_lang).strip()
+                else:
+                    if progress_callback:
+                        progress_callback(
+                            page_index + 1,
+                            total_pages,
+                            f"Page {page_index + 1}/{total_pages}: Running Tesseract OCR ({ocr_lang})...",
+                        )
+                    text = tesseract_ocr_page(png_bytes=png_bytes, lang=ocr_lang)
             else:
                 if progress_callback:
                     progress_callback(
@@ -121,7 +146,7 @@ def extract_pages_text(
                         total_pages,
                         f"Page {page_index + 1}/{total_pages}: Extracted digital text.",
                     )
-                text = clean_ocr_text(raw_text)
+                text = raw_text
 
             pages_text.append(text if text else "[No text detected on this page]")
 
@@ -137,10 +162,7 @@ def pages_text_to_docx_bytes(
 ) -> bytes:
     """Build Word (.docx) bytes from a list of per-page strings."""
     doc = Document()
-
-    normal_style = doc.styles["Normal"]
-    normal_style.font.name = font_name
-    normal_style.font.size = Pt(font_size)
+    apply_doc_font(doc, font_name=font_name, font_size=font_size)
 
     total_pages = len(pages_text)
     for page_index, text in enumerate(pages_text):
@@ -148,9 +170,9 @@ def pages_text_to_docx_bytes(
         for run in heading.runs:
             set_run_font(run, font_name=font_name, font_size=font_size + 2)
 
-        for para_text in text.split("\n\n"):
+        for line in text.splitlines():
             p = doc.add_paragraph()
-            run = p.add_run(para_text.replace("\n", " ").strip())
+            run = p.add_run(line)
             set_run_font(run, font_name=font_name, font_size=font_size)
 
         if page_index < total_pages - 1:
@@ -166,16 +188,22 @@ def convert_pdf_bytes_to_docx_bytes(
     pdf_bytes: bytes,
     font_name: str = "Pyidaungsu",
     font_size: int = 11,
-    ocr_lang: str = "mya",
-    force_ocr: bool = True,
-    dpi: int = 400,
+    use_gemini_vision: bool = True,
+    gemini_api_key: Optional[str] = None,
+    gemini_model: str = DEFAULT_MODEL,
+    ocr_lang: str = "mya+eng",
+    force_vision_or_ocr: bool = True,
+    dpi: int = 250,
     progress_callback: Optional[Callable[[int, int, str], None]] = None,
 ) -> bytes:
     """Convert PDF bytes directly into Word (.docx) bytes."""
     pages_text = extract_pages_text(
         pdf_bytes=pdf_bytes,
+        use_gemini_vision=use_gemini_vision,
+        gemini_api_key=gemini_api_key,
+        gemini_model=gemini_model,
         ocr_lang=ocr_lang,
-        force_ocr=force_ocr,
+        force_vision_or_ocr=force_vision_or_ocr,
         dpi=dpi,
         progress_callback=progress_callback,
     )
@@ -191,9 +219,12 @@ def convert_pdf_to_docx(
     docx_path: str,
     font_name: str = "Pyidaungsu",
     font_size: int = 11,
-    ocr_lang: str = "mya",
-    force_ocr: bool = True,
-    dpi: int = 400,
+    use_gemini_vision: bool = True,
+    gemini_api_key: Optional[str] = None,
+    gemini_model: str = DEFAULT_MODEL,
+    ocr_lang: str = "mya+eng",
+    force_vision_or_ocr: bool = True,
+    dpi: int = 250,
 ) -> None:
     """Convert a PDF file on disk to a .docx file on disk."""
     pdf_file = Path(pdf_path)
@@ -204,8 +235,11 @@ def convert_pdf_to_docx(
         pdf_bytes=pdf_file.read_bytes(),
         font_name=font_name,
         font_size=font_size,
+        use_gemini_vision=use_gemini_vision,
+        gemini_api_key=gemini_api_key,
+        gemini_model=gemini_model,
         ocr_lang=ocr_lang,
-        force_ocr=force_ocr,
+        force_vision_or_ocr=force_vision_or_ocr,
         dpi=dpi,
     )
 
@@ -216,15 +250,18 @@ def convert_pdf_to_docx(
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
-        description="Convert Myanmar + English PDF files to Word (.docx)."
+        description="Convert Myanmar + English PDF files to Word (.docx) using Gemini Vision or OCR."
     )
     parser.add_argument("input_pdf", help="Path to input PDF file")
     parser.add_argument("output_docx", help="Path to output .docx file")
     parser.add_argument("--font", default="Pyidaungsu", help="Word font name (default: Pyidaungsu)")
     parser.add_argument("--size", type=int, default=11, help="Font size in pt (default: 11)")
-    parser.add_argument("--lang", default="mya", help="Tesseract OCR languages (default: mya)")
-    parser.add_argument("--dpi", type=int, default=400, help="OCR render DPI (default: 400)")
-    parser.add_argument("--force-ocr", action="store_true", help="Force OCR on every page")
+    parser.add_argument("--api-key", default="", help="Gemini API key (or set GEMINI_API_KEY env var)")
+    parser.add_argument("--model", default=DEFAULT_MODEL, help=f"Gemini model (default: {DEFAULT_MODEL})")
+    parser.add_argument("--no-gemini", action="store_true", help="Use Tesseract OCR instead of Gemini Vision")
+    parser.add_argument("--lang", default="mya+eng", help="Tesseract fallback language (default: mya+eng)")
+    parser.add_argument("--dpi", type=int, default=250, help="Page render DPI (default: 250)")
+    parser.add_argument("--digital-first", action="store_true", help="Use digital PDF text when available")
 
     args = parser.parse_args()
     convert_pdf_to_docx(
@@ -232,8 +269,11 @@ if __name__ == "__main__":
         docx_path=args.output_docx,
         font_name=args.font,
         font_size=args.size,
+        use_gemini_vision=not args.no_gemini,
+        gemini_api_key=args.api_key or None,
+        gemini_model=args.model,
         ocr_lang=args.lang,
-        force_ocr=args.force_ocr,
+        force_vision_or_ocr=not args.digital_first,
         dpi=args.dpi,
     )
     print(f"Done! Saved Word document to: {args.output_docx}")
