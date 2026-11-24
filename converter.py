@@ -34,7 +34,7 @@ def set_run_font(run, font_name: str = "Pyidaungsu", font_size: int = 11) -> Non
 
 
 def clean_ocr_text(raw_text: str) -> str:
-    """Clean up common OCR spacing/line-break issues while keeping paragraphs."""
+    """Clean up common OCR noise, symbols, and line breaks automatically."""
     lines = [re.sub(r"[ \t]+", " ", line).strip() for line in raw_text.splitlines()]
     paragraphs: List[str] = []
     current_para: List[str] = []
@@ -46,10 +46,12 @@ def clean_ocr_text(raw_text: str) -> str:
                 current_para = []
             continue
 
-        # Join wrapped lines within the same paragraph
+        # Remove standalone noisy symbol/punctuation lines
+        if re.fullmatch(r"[\W_]+", line):
+            continue
+
         if current_para:
             prev = current_para[-1]
-            # If previous line doesn't end with sentence/block punctuation, join with space
             if not re.search(r"[။!?…:]$", prev):
                 current_para[-1] = f"{prev} {line}"
             else:
@@ -62,16 +64,24 @@ def clean_ocr_text(raw_text: str) -> str:
         paragraphs.append(" ".join(current_para))
 
     cleaned = "\n\n".join(paragraphs)
-    # Clean up redundant spaces around Myanmar punctuation
+
+    # Remove common OCR noise characters around Myanmar/English text
+    cleaned = re.sub(r"[()|~^#*\[\]<>_=+@]+", " ", cleaned)
+    # Remove isolated 1-character Latin noise surrounded by spaces
+    cleaned = re.sub(r"(?<=\s)[b-hj-zB-HJ-Z](?=\s)", " ", cleaned)
+    # Clean up spaces before Myanmar punctuation
     cleaned = re.sub(r"\s+([၊။])", r"\1", cleaned)
+    # Collapse multiple spaces
+    cleaned = re.sub(r"[ \t]{2,}", " ", cleaned)
+    # Clean up multiple blank lines
+    cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)
     return cleaned.strip()
 
 
-def ocr_page(page: fitz.Page, dpi: int = 400, lang: str = "mya+eng") -> str:
-    """Render a PDF page to an image and run Tesseract OCR for Myanmar + English."""
+def ocr_page(page: fitz.Page, dpi: int = 400, lang: str = "mya") -> str:
+    """Render a PDF page to an image and run Tesseract OCR."""
     pix = page.get_pixmap(dpi=dpi)
     img = Image.open(io.BytesIO(pix.tobytes("png")))
-    # Grayscale + autocontrast helps sharpen text edges before OCR
     gray = ImageOps.grayscale(img)
     enhanced = ImageOps.autocontrast(gray)
     text = pytesseract.image_to_string(enhanced, lang=lang, config="--psm 6")
@@ -80,8 +90,8 @@ def ocr_page(page: fitz.Page, dpi: int = 400, lang: str = "mya+eng") -> str:
 
 def extract_pages_text(
     pdf_bytes: bytes,
-    ocr_lang: str = "mya+eng",
-    force_ocr: bool = False,
+    ocr_lang: str = "mya",
+    force_ocr: bool = True,
     min_chars_threshold: int = 20,
     dpi: int = 400,
     progress_callback: Optional[Callable[[int, int, str], None]] = None,
@@ -111,7 +121,7 @@ def extract_pages_text(
                         total_pages,
                         f"Page {page_index + 1}/{total_pages}: Extracted digital text.",
                     )
-                text = raw_text
+                text = clean_ocr_text(raw_text)
 
             pages_text.append(text if text else "[No text detected on this page]")
 
@@ -156,8 +166,8 @@ def convert_pdf_bytes_to_docx_bytes(
     pdf_bytes: bytes,
     font_name: str = "Pyidaungsu",
     font_size: int = 11,
-    ocr_lang: str = "mya+eng",
-    force_ocr: bool = False,
+    ocr_lang: str = "mya",
+    force_ocr: bool = True,
     dpi: int = 400,
     progress_callback: Optional[Callable[[int, int, str], None]] = None,
 ) -> bytes:
@@ -181,8 +191,8 @@ def convert_pdf_to_docx(
     docx_path: str,
     font_name: str = "Pyidaungsu",
     font_size: int = 11,
-    ocr_lang: str = "mya+eng",
-    force_ocr: bool = False,
+    ocr_lang: str = "mya",
+    force_ocr: bool = True,
     dpi: int = 400,
 ) -> None:
     """Convert a PDF file on disk to a .docx file on disk."""
@@ -212,7 +222,7 @@ if __name__ == "__main__":
     parser.add_argument("output_docx", help="Path to output .docx file")
     parser.add_argument("--font", default="Pyidaungsu", help="Word font name (default: Pyidaungsu)")
     parser.add_argument("--size", type=int, default=11, help="Font size in pt (default: 11)")
-    parser.add_argument("--lang", default="mya+eng", help="Tesseract OCR languages (default: mya+eng)")
+    parser.add_argument("--lang", default="mya", help="Tesseract OCR languages (default: mya)")
     parser.add_argument("--dpi", type=int, default=400, help="OCR render DPI (default: 400)")
     parser.add_argument("--force-ocr", action="store_true", help="Force OCR on every page")
 
