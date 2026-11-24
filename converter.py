@@ -1,7 +1,9 @@
 import argparse
 import io
+import os
+import shutil
 from pathlib import Path
-from typing import Callable, Optional
+from typing import Callable, List, Optional
 import fitz  # PyMuPDF
 from PIL import Image
 import pytesseract
@@ -9,6 +11,11 @@ from docx import Document
 from docx.shared import Pt
 from docx.oxml import OxmlElement
 from docx.oxml.ns import qn
+
+if not shutil.which("tesseract"):
+    default_tesseract = r"C:\Program Files\Tesseract-OCR\tesseract.exe"
+    if os.path.exists(default_tesseract):
+        pytesseract.pytesseract.tesseract_cmd = default_tesseract
 
 
 def set_run_font(run, font_name: str = "Pyidaungsu", font_size: int = 11) -> None:
@@ -32,30 +39,24 @@ def ocr_page(page: fitz.Page, dpi: int = 300, lang: str = "mya+eng") -> str:
     return pytesseract.image_to_string(img, lang=lang)
 
 
-def convert_pdf_bytes_to_docx_bytes(
+def extract_pages_text(
     pdf_bytes: bytes,
-    font_name: str = "Pyidaungsu",
-    font_size: int = 11,
     ocr_lang: str = "mya+eng",
     force_ocr: bool = False,
+    min_chars_threshold: int = 20,
     progress_callback: Optional[Callable[[int, int, str], None]] = None,
-) -> bytes:
-    """Convert PDF bytes into Word (.docx) bytes in memory for Streamlit."""
-    doc = Document()
-
-    normal_style = doc.styles["Normal"]
-    normal_style.font.name = font_name
-    normal_style.font.size = Pt(font_size)
-
+) -> List[str]:
+    """Extract text per page from PDF bytes (with automatic/forced OCR fallback)."""
     pdf_doc = fitz.open(stream=pdf_bytes, filetype="pdf")
     total_pages = len(pdf_doc)
+    pages_text: List[str] = []
 
     try:
         for page_index in range(total_pages):
             page = pdf_doc[page_index]
-            text = "" if force_ocr else page.get_text("text").strip()
+            raw_text = "" if force_ocr else page.get_text("text").strip()
 
-            if not text:
+            if force_ocr or len(raw_text) < min_chars_threshold:
                 if progress_callback:
                     progress_callback(
                         page_index + 1,
@@ -70,26 +71,67 @@ def convert_pdf_bytes_to_docx_bytes(
                         total_pages,
                         f"Page {page_index + 1}/{total_pages}: Extracted digital text.",
                     )
+                text = raw_text
 
-            heading = doc.add_heading(f"Page {page_index + 1}", level=2)
-            for run in heading.runs:
-                set_run_font(run, font_name=font_name, font_size=font_size + 2)
+            pages_text.append(text if text else "[No text detected on this page]")
 
-            lines = text.splitlines() if text else ["[No text detected on this page]"]
-            for line in lines:
-                p = doc.add_paragraph()
-                run = p.add_run(line)
-                set_run_font(run, font_name=font_name, font_size=font_size)
-
-            if page_index < total_pages - 1:
-                doc.add_page_break()
-
-        output_buffer = io.BytesIO()
-        doc.save(output_buffer)
-        output_buffer.seek(0)
-        return output_buffer.getvalue()
+        return pages_text
     finally:
         pdf_doc.close()
+
+
+def pages_text_to_docx_bytes(
+    pages_text: List[str],
+    font_name: str = "Pyidaungsu",
+    font_size: int = 11,
+) -> bytes:
+    """Build Word (.docx) bytes from a list of per-page strings."""
+    doc = Document()
+
+    normal_style = doc.styles["Normal"]
+    normal_style.font.name = font_name
+    normal_style.font.size = Pt(font_size)
+
+    total_pages = len(pages_text)
+    for page_index, text in enumerate(pages_text):
+        heading = doc.add_heading(f"Page {page_index + 1}", level=2)
+        for run in heading.runs:
+            set_run_font(run, font_name=font_name, font_size=font_size + 2)
+
+        for line in text.splitlines():
+            p = doc.add_paragraph()
+            run = p.add_run(line)
+            set_run_font(run, font_name=font_name, font_size=font_size)
+
+        if page_index < total_pages - 1:
+            doc.add_page_break()
+
+    output_buffer = io.BytesIO()
+    doc.save(output_buffer)
+    output_buffer.seek(0)
+    return output_buffer.getvalue()
+
+
+def convert_pdf_bytes_to_docx_bytes(
+    pdf_bytes: bytes,
+    font_name: str = "Pyidaungsu",
+    font_size: int = 11,
+    ocr_lang: str = "mya+eng",
+    force_ocr: bool = False,
+    progress_callback: Optional[Callable[[int, int, str], None]] = None,
+) -> bytes:
+    """Convert PDF bytes directly into Word (.docx) bytes."""
+    pages_text = extract_pages_text(
+        pdf_bytes=pdf_bytes,
+        ocr_lang=ocr_lang,
+        force_ocr=force_ocr,
+        progress_callback=progress_callback,
+    )
+    return pages_text_to_docx_bytes(
+        pages_text=pages_text,
+        font_name=font_name,
+        font_size=font_size,
+    )
 
 
 def convert_pdf_to_docx(
