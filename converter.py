@@ -2,6 +2,7 @@ import argparse
 import io
 import os
 import shutil
+import time
 from pathlib import Path
 from typing import Callable, List, Optional
 import fitz  # PyMuPDF
@@ -13,6 +14,7 @@ from docx.oxml import OxmlElement
 from docx.oxml.ns import qn
 from google import genai
 from google.genai import types
+from google.genai.errors import APIError
 
 if not shutil.which("tesseract"):
     default_tesseract = r"C:\Program Files\Tesseract-OCR\tesseract.exe"
@@ -71,17 +73,32 @@ def gemini_vision_page(
     png_bytes: bytes,
     api_key: str,
     model_name: str = DEFAULT_MODEL,
+    max_retries: int = 3,
 ) -> str:
-    """Extract Myanmar + English text from a page image using Gemini Vision."""
+    """Extract Myanmar + English text from a page image using Gemini Vision with retry."""
     client = genai.Client(api_key=api_key)
-    response = client.models.generate_content(
-        model=model_name,
-        contents=[
-            types.Part.from_bytes(data=png_bytes, mime_type="image/png"),
-            VISION_PROMPT,
-        ],
-    )
-    return (response.text or "").strip()
+    last_exc: Optional[Exception] = None
+
+    for attempt in range(1, max_retries + 1):
+        try:
+            response = client.models.generate_content(
+                model=model_name,
+                contents=[
+                    types.Part.from_bytes(data=png_bytes, mime_type="image/png"),
+                    VISION_PROMPT,
+                ],
+            )
+            return (response.text or "").strip()
+        except APIError as exc:
+            last_exc = exc
+            if getattr(exc, "code", None) in (503, 429, 500) and attempt < max_retries:
+                time.sleep(attempt * 2)
+                continue
+            raise
+
+    if last_exc:
+        raise last_exc
+    return ""
 
 
 def tesseract_ocr_page(png_bytes: bytes, lang: str = "mya+eng") -> str:
