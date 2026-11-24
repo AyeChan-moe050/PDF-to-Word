@@ -1,6 +1,7 @@
+import os
 from pathlib import Path
 import streamlit as st
-from converter import convert_pdf_bytes_to_docx_bytes
+from converter import DEFAULT_MODEL, convert_pdf_bytes_to_docx_bytes
 
 st.set_page_config(
     page_title="Myanmar + English PDF to Word",
@@ -9,21 +10,49 @@ st.set_page_config(
 )
 
 st.title("Myanmar + English PDF to Word Converter")
-st.write("Upload a PDF file and download the `.docx` directly.")
+st.write("Upload a PDF file and convert it into a `.docx` file with **Pyidaungsu** font.")
+
+env_api_key = os.getenv("GEMINI_API_KEY", "")
 
 with st.sidebar:
-    st.header("Conversion Settings")
-    font_name = st.text_input("Word Font Name", value="Pyidaungsu")
-    font_size = st.slider("Font Size (pt)", min_value=9, max_value=24, value=11)
-    ocr_lang = st.selectbox(
-        "OCR Languages",
-        options=["mya", "mya+eng", "eng"],
+    st.header("Recognition Engine")
+    engine = st.radio(
+        "Choose Engine",
+        options=["Gemini Vision (Recommended)", "Tesseract OCR"],
         index=0,
     )
-    force_ocr = st.checkbox(
-        "Force OCR on all pages",
+    use_gemini = engine.startswith("Gemini Vision")
+
+    gemini_api_key = ""
+    gemini_model = DEFAULT_MODEL
+    ocr_lang = "mya+eng"
+
+    if use_gemini:
+        gemini_api_key = st.text_input(
+            "Gemini API Key",
+            value=env_api_key,
+            type="password",
+            help="Enter your Google Gemini API key (or set GEMINI_API_KEY in environment / Streamlit Secrets).",
+        )
+        gemini_model = st.selectbox(
+            "Gemini Model",
+            options=["gemini-2.5-flash", "gemini-2.5-pro"],
+            index=0,
+        )
+    else:
+        ocr_lang = st.selectbox(
+            "OCR Languages",
+            options=["mya+eng", "mya", "eng"],
+            index=0,
+        )
+
+    st.header("Word Formatting")
+    font_name = st.text_input("Word Font Name", value="Pyidaungsu")
+    font_size = st.slider("Font Size (pt)", min_value=9, max_value=24, value=11)
+    force_vision_or_ocr = st.checkbox(
+        "Process all pages with Vision/OCR",
         value=True,
-        help="Recommended for scanned PDFs or PDFs with broken Myanmar font encoding.",
+        help="Recommended when PDF text extraction has broken Myanmar font encoding.",
     )
 
 uploaded_file = st.file_uploader("Choose a PDF file", type=["pdf"])
@@ -43,8 +72,11 @@ if uploaded_file is not None:
                     pdf_bytes=uploaded_file.getvalue(),
                     font_name=font_name.strip() or "Pyidaungsu",
                     font_size=font_size,
+                    use_gemini_vision=use_gemini,
+                    gemini_api_key=gemini_api_key.strip() or None,
+                    gemini_model=gemini_model,
                     ocr_lang=ocr_lang,
-                    force_ocr=force_ocr,
+                    force_vision_or_ocr=force_vision_or_ocr,
                     progress_callback=on_progress,
                 )
 
