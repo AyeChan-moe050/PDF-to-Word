@@ -19,7 +19,7 @@ if not shutil.which("tesseract"):
     if os.path.exists(default_tesseract):
         pytesseract.pytesseract.tesseract_cmd = default_tesseract
 
-DEFAULT_MODEL = "gemini-2.5-flash"
+DEFAULT_MODEL = "gemini-3.8-flash"
 
 VISION_PROMPT = """Extract all text from this document page accurately.
 Rules:
