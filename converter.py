@@ -1,11 +1,12 @@
 import argparse
 import io
 import os
+import re
 import shutil
 from pathlib import Path
 from typing import Callable, List, Optional
 import fitz  # PyMuPDF
-from PIL import Image
+from PIL import Image, ImageOps
 import pytesseract
 from docx import Document
 from docx.shared import Pt
@@ -32,11 +33,49 @@ def set_run_font(run, font_name: str = "Pyidaungsu", font_size: int = 11) -> Non
     rFonts.set(qn("w:cs"), font_name)
 
 
-def ocr_page(page: fitz.Page, dpi: int = 300, lang: str = "mya+eng") -> str:
+def clean_ocr_text(raw_text: str) -> str:
+    """Clean up common OCR spacing/line-break issues while keeping paragraphs."""
+    lines = [re.sub(r"[ \t]+", " ", line).strip() for line in raw_text.splitlines()]
+    paragraphs: List[str] = []
+    current_para: List[str] = []
+
+    for line in lines:
+        if not line:
+            if current_para:
+                paragraphs.append(" ".join(current_para))
+                current_para = []
+            continue
+
+        # Join wrapped lines within the same paragraph
+        if current_para:
+            prev = current_para[-1]
+            # If previous line doesn't end with sentence/block punctuation, join with space
+            if not re.search(r"[။!?…:]$", prev):
+                current_para[-1] = f"{prev} {line}"
+            else:
+                paragraphs.append(" ".join(current_para))
+                current_para = [line]
+        else:
+            current_para.append(line)
+
+    if current_para:
+        paragraphs.append(" ".join(current_para))
+
+    cleaned = "\n\n".join(paragraphs)
+    # Clean up redundant spaces around Myanmar punctuation
+    cleaned = re.sub(r"\s+([၊။])", r"\1", cleaned)
+    return cleaned.strip()
+
+
+def ocr_page(page: fitz.Page, dpi: int = 400, lang: str = "mya+eng") -> str:
     """Render a PDF page to an image and run Tesseract OCR for Myanmar + English."""
     pix = page.get_pixmap(dpi=dpi)
     img = Image.open(io.BytesIO(pix.tobytes("png")))
-    return pytesseract.image_to_string(img, lang=lang)
+    # Grayscale + autocontrast helps sharpen text edges before OCR
+    gray = ImageOps.grayscale(img)
+    enhanced = ImageOps.autocontrast(gray)
+    text = pytesseract.image_to_string(enhanced, lang=lang, config="--psm 6")
+    return clean_ocr_text(text)
 
 
 def extract_pages_text(
@@ -44,6 +83,7 @@ def extract_pages_text(
     ocr_lang: str = "mya+eng",
     force_ocr: bool = False,
     min_chars_threshold: int = 20,
+    dpi: int = 400,
     progress_callback: Optional[Callable[[int, int, str], None]] = None,
 ) -> List[str]:
     """Extract text per page from PDF bytes (with automatic/forced OCR fallback)."""
@@ -61,9 +101,9 @@ def extract_pages_text(
                     progress_callback(
                         page_index + 1,
                         total_pages,
-                        f"Page {page_index + 1}/{total_pages}: Running OCR ({ocr_lang})...",
+                        f"Page {page_index + 1}/{total_pages}: Running OCR ({ocr_lang}, {dpi} DPI)...",
                     )
-                text = ocr_page(page, lang=ocr_lang).strip()
+                text = ocr_page(page, dpi=dpi, lang=ocr_lang).strip()
             else:
                 if progress_callback:
                     progress_callback(
@@ -98,9 +138,9 @@ def pages_text_to_docx_bytes(
         for run in heading.runs:
             set_run_font(run, font_name=font_name, font_size=font_size + 2)
 
-        for line in text.splitlines():
+        for para_text in text.split("\n\n"):
             p = doc.add_paragraph()
-            run = p.add_run(line)
+            run = p.add_run(para_text.replace("\n", " ").strip())
             set_run_font(run, font_name=font_name, font_size=font_size)
 
         if page_index < total_pages - 1:
@@ -118,6 +158,7 @@ def convert_pdf_bytes_to_docx_bytes(
     font_size: int = 11,
     ocr_lang: str = "mya+eng",
     force_ocr: bool = False,
+    dpi: int = 400,
     progress_callback: Optional[Callable[[int, int, str], None]] = None,
 ) -> bytes:
     """Convert PDF bytes directly into Word (.docx) bytes."""
@@ -125,6 +166,7 @@ def convert_pdf_bytes_to_docx_bytes(
         pdf_bytes=pdf_bytes,
         ocr_lang=ocr_lang,
         force_ocr=force_ocr,
+        dpi=dpi,
         progress_callback=progress_callback,
     )
     return pages_text_to_docx_bytes(
@@ -141,6 +183,7 @@ def convert_pdf_to_docx(
     font_size: int = 11,
     ocr_lang: str = "mya+eng",
     force_ocr: bool = False,
+    dpi: int = 400,
 ) -> None:
     """Convert a PDF file on disk to a .docx file on disk."""
     pdf_file = Path(pdf_path)
@@ -153,6 +196,7 @@ def convert_pdf_to_docx(
         font_size=font_size,
         ocr_lang=ocr_lang,
         force_ocr=force_ocr,
+        dpi=dpi,
     )
 
     out_file = Path(docx_path)
@@ -169,6 +213,7 @@ if __name__ == "__main__":
     parser.add_argument("--font", default="Pyidaungsu", help="Word font name (default: Pyidaungsu)")
     parser.add_argument("--size", type=int, default=11, help="Font size in pt (default: 11)")
     parser.add_argument("--lang", default="mya+eng", help="Tesseract OCR languages (default: mya+eng)")
+    parser.add_argument("--dpi", type=int, default=400, help="OCR render DPI (default: 400)")
     parser.add_argument("--force-ocr", action="store_true", help="Force OCR on every page")
 
     args = parser.parse_args()
@@ -179,5 +224,6 @@ if __name__ == "__main__":
         font_size=args.size,
         ocr_lang=args.lang,
         force_ocr=args.force_ocr,
+        dpi=args.dpi,
     )
     print(f"Done! Saved Word document to: {args.output_docx}")
