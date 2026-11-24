@@ -22,7 +22,6 @@ if not shutil.which("tesseract"):
         pytesseract.pytesseract.tesseract_cmd = default_tesseract
 
 DEFAULT_MODEL = "gemini-3.8-flash"
-FALLBACK_MODEL = "gemini-3.8-pro"
 
 VISION_PROMPT = """Extract all text from this document page accurately.
 Rules:
@@ -70,6 +69,24 @@ def render_page_png_bytes(page: fitz.Page, dpi: int = 250) -> bytes:
     return pix.tobytes("png")
 
 
+def list_available_gemini_models(api_key: str) -> List[str]:
+    """List Gemini model names available for this API key."""
+    client = genai.Client(api_key=api_key)
+    models: List[str] = []
+    for m in client.models.list():
+        name = getattr(m, "name", "") or ""
+        short_name = name.replace("models/", "", 1)
+        if short_name and "gemini" in short_name.lower():
+            models.append(short_name)
+
+    # Prioritize flash/pro models if present
+    preferred = [DEFAULT_MODEL]
+    for candidate in models:
+        if candidate not in preferred:
+            preferred.append(candidate)
+    return preferred
+
+
 def _call_gemini_with_retry(
     client: genai.Client,
     png_bytes: bytes,
@@ -90,7 +107,8 @@ def _call_gemini_with_retry(
             return (response.text or "").strip()
         except APIError as exc:
             last_exc = exc
-            if getattr(exc, "code", None) in (503, 429, 500) and attempt < max_retries:
+            code = getattr(exc, "code", None)
+            if code in (503, 429, 500) and attempt < max_retries:
                 time.sleep(attempt * 1.5)
                 continue
             raise
@@ -103,30 +121,37 @@ def gemini_vision_page(
     png_bytes: bytes,
     api_key: str,
     model_name: str = DEFAULT_MODEL,
-    fallback_model: str = FALLBACK_MODEL,
 ) -> str:
-    """Extract Myanmar + English text using Gemini Vision, falling back if busy."""
+    """Extract Myanmar + English text using Gemini Vision, trying available models if needed."""
     client = genai.Client(api_key=api_key)
+    candidates: List[str] = [model_name]
+
     try:
-        return _call_gemini_with_retry(
-            client=client,
-            png_bytes=png_bytes,
-            model_name=model_name,
-            max_retries=2,
-        )
-    except APIError as exc:
-        if (
-            getattr(exc, "code", None) in (503, 429, 500)
-            and fallback_model
-            and fallback_model != model_name
-        ):
+        for available in list_available_gemini_models(api_key):
+            if available not in candidates and ("flash" in available or "pro" in available):
+                candidates.append(available)
+    except Exception:
+        pass
+
+    last_exc: Optional[Exception] = None
+    for candidate in candidates[:4]:
+        try:
             return _call_gemini_with_retry(
                 client=client,
                 png_bytes=png_bytes,
-                model_name=fallback_model,
+                model_name=candidate,
                 max_retries=2,
             )
-        raise
+        except APIError as exc:
+            last_exc = exc
+            code = getattr(exc, "code", None)
+            if code in (404, 503, 429, 500):
+                continue
+            raise
+
+    if last_exc:
+        raise last_exc
+    raise RuntimeError("No Gemini vision model succeeded for this page.")
 
 
 def tesseract_ocr_page(png_bytes: bytes, lang: str = "mya+eng") -> str:
