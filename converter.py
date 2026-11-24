@@ -22,6 +22,7 @@ if not shutil.which("tesseract"):
         pytesseract.pytesseract.tesseract_cmd = default_tesseract
 
 DEFAULT_MODEL = "gemini-3.8-flash"
+FALLBACK_MODEL = "gemini-3.8-pro"
 
 VISION_PROMPT = """Extract all text from this document page accurately.
 Rules:
@@ -69,16 +70,14 @@ def render_page_png_bytes(page: fitz.Page, dpi: int = 250) -> bytes:
     return pix.tobytes("png")
 
 
-def gemini_vision_page(
+def _call_gemini_with_retry(
+    client: genai.Client,
     png_bytes: bytes,
-    api_key: str,
-    model_name: str = DEFAULT_MODEL,
-    max_retries: int = 3,
+    model_name: str,
+    max_retries: int = 2,
 ) -> str:
-    """Extract Myanmar + English text from a page image using Gemini Vision with retry."""
-    client = genai.Client(api_key=api_key)
+    """Call a specific Gemini model with short retries for transient errors."""
     last_exc: Optional[Exception] = None
-
     for attempt in range(1, max_retries + 1):
         try:
             response = client.models.generate_content(
@@ -92,13 +91,42 @@ def gemini_vision_page(
         except APIError as exc:
             last_exc = exc
             if getattr(exc, "code", None) in (503, 429, 500) and attempt < max_retries:
-                time.sleep(attempt * 2)
+                time.sleep(attempt * 1.5)
                 continue
             raise
-
     if last_exc:
         raise last_exc
     return ""
+
+
+def gemini_vision_page(
+    png_bytes: bytes,
+    api_key: str,
+    model_name: str = DEFAULT_MODEL,
+    fallback_model: str = FALLBACK_MODEL,
+) -> str:
+    """Extract Myanmar + English text using Gemini Vision, falling back if busy."""
+    client = genai.Client(api_key=api_key)
+    try:
+        return _call_gemini_with_retry(
+            client=client,
+            png_bytes=png_bytes,
+            model_name=model_name,
+            max_retries=2,
+        )
+    except APIError as exc:
+        if (
+            getattr(exc, "code", None) in (503, 429, 500)
+            and fallback_model
+            and fallback_model != model_name
+        ):
+            return _call_gemini_with_retry(
+                client=client,
+                png_bytes=png_bytes,
+                model_name=fallback_model,
+                max_retries=2,
+            )
+        raise
 
 
 def tesseract_ocr_page(png_bytes: bytes, lang: str = "mya+eng") -> str:
